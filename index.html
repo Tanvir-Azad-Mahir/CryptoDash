@@ -157,6 +157,11 @@
       background: rgba(255,255,255,.06);
     }
 
+    #searchInput::-webkit-search-cancel-button {
+      -webkit-appearance: none;
+      appearance: none;
+    }
+
     .clear-search {
       display: none;
       position: absolute;
@@ -419,7 +424,7 @@
       overflow: hidden;
       border: 1px solid var(--border);
       border-radius: 20px;
-      background: rgba(5,14,27,.65);
+      background: var(--panel);
     }
 
     .table-scroll {
@@ -843,9 +848,18 @@
 
 
     function initTheme() {
-      const saved = localStorage.getItem("cryptowizard-theme");
-      const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
-      const theme = saved || (prefersLight ? "light" : "dark");
+      let saved = null;
+      try {
+        saved = localStorage.getItem("cryptowizard-theme");
+      } catch (_) {}
+
+      const prefersLight = window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: light)").matches;
+
+      const theme = saved === "light" || saved === "dark"
+        ? saved
+        : (prefersLight ? "light" : "dark");
+
       applyTheme(theme);
     }
 
@@ -853,7 +867,10 @@
       const current = document.body.dataset.theme || "dark";
       const next = current === "dark" ? "light" : "dark";
       applyTheme(next);
-      localStorage.setItem("cryptowizard-theme", next);
+
+      try {
+        localStorage.setItem("cryptowizard-theme", next);
+      } catch (_) {}
     }
 
     function applyTheme(theme) {
@@ -872,43 +889,119 @@
 
     async function refreshAll() {
       if (isFetching) return;
+
       isFetching = true;
+      els.refreshBtn.disabled = true;
+      els.refreshBtn.setAttribute("aria-busy", "true");
       els.refreshBtn.style.transform = "rotate(180deg)";
       showLoading();
 
+      const globalRequest = fetch(`${BASE_URL}/global`);
+      const coinsRequest = fetch(
+        `${BASE_URL}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=true&price_change_percentage=24h`
+      );
+
+      let globalError = null;
+      let coinsError = null;
+      let updatedSomething = false;
+
       try {
-        const [globalRes, coinsRes] = await Promise.all([
-          fetch(`${BASE_URL}/global`),
-          fetch(`${BASE_URL}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=true&price_change_percentage=24h`)
+        const [globalResult, coinsResult] = await Promise.allSettled([
+          globalRequest,
+          coinsRequest
         ]);
 
-        if (!globalRes.ok) throwApiError(globalRes);
-        if (!coinsRes.ok) throwApiError(coinsRes);
+        // Global stats are optional: failure here should not kill the coin table.
+        if (globalResult.status === "fulfilled") {
+          try {
+            const response = globalResult.value;
+            if (!response.ok) throwApiError(response);
 
-        const [globalJson, coinsJson] = await Promise.all([
-          globalRes.json(),
-          coinsRes.json()
-        ]);
+            const json = await response.json();
+            if (json?.data) {
+              displayGlobalStats(json.data);
+              updatedSomething = true;
+            } else {
+              throw new Error("Global market data was empty.");
+            }
+          } catch (error) {
+            globalError = error;
+          }
+        } else {
+          globalError = globalResult.reason;
+        }
 
-        displayGlobalStats(globalJson.data);
-        allCoins = Array.isArray(coinsJson) ? coinsJson : [];
-        filteredCoins = applySearch(allCoins, els.searchInput.value);
-        sortAndDisplayCoins();
-        renderCharts(allCoins);
-        setApiHealthy(true);
-        hideError();
+        // Coin-list data is the core dashboard feed.
+        if (coinsResult.status === "fulfilled") {
+          try {
+            const response = coinsResult.value;
+            if (!response.ok) throwApiError(response);
 
-        els.lastUpdated.textContent = new Intl.DateTimeFormat(undefined, {
-          hour: "2-digit",
-          minute: "2-digit"
-        }).format(new Date());
+            const json = await response.json();
+            if (!Array.isArray(json)) {
+              throw new Error("Unexpected market-data response.");
+            }
+
+            allCoins = json;
+            filteredCoins = applySearch(allCoins, els.searchInput.value);
+            sortAndDisplayCoins();
+            renderCharts(allCoins);
+            updatedSomething = true;
+          } catch (error) {
+            coinsError = error;
+          }
+        } else {
+          coinsError = coinsResult.reason;
+        }
+
+        // Keep previously loaded content visible on refresh failures.
+        if (coinsError && !allCoins.length) {
+          els.coinsContainer.classList.add("hidden");
+          els.resultSummary.textContent = "Market data unavailable";
+        }
+
+        // If stats fail on first load, provide useful placeholders.
+        if (globalError && !els.globalStats.children.length) {
+          displayGlobalStatsPlaceholder();
+        }
+
+        if (updatedSomething) {
+          els.lastUpdated.textContent = new Intl.DateTimeFormat(undefined, {
+            hour: "2-digit",
+            minute: "2-digit"
+          }).format(new Date());
+        }
+
+        if (!globalError && !coinsError) {
+          setApiHealthy(true);
+          hideError();
+        } else if (!coinsError) {
+          // Core market feed works, but stats are degraded.
+          setApiHealthy(true);
+          showWarning("Live coin data loaded, but global market statistics are temporarily unavailable.");
+        } else if (allCoins.length) {
+          // A refresh failed, but cached in-memory data is still on screen.
+          setApiHealthy(false);
+          showWarning("Refresh failed. Showing the most recently loaded market data.");
+        } else {
+          setApiHealthy(false);
+          const message = coinsError?.message || globalError?.message || "Unable to load market data.";
+          showError(message);
+        }
       } catch (error) {
         console.error(error);
         setApiHealthy(false);
-        showError(error.message || "Unable to load market data.");
+
+        if (allCoins.length) {
+          showWarning("Refresh failed. Showing the most recently loaded market data.");
+        } else {
+          showError(error.message || "Unable to load market data.");
+        }
       } finally {
         hideLoading();
         isFetching = false;
+        els.refreshBtn.disabled = false;
+        els.refreshBtn.removeAttribute("aria-busy");
         els.refreshBtn.style.transform = "";
       }
     }
@@ -918,6 +1011,15 @@
         throw new Error("CoinGecko rate limit reached. Please try again shortly.");
       }
       throw new Error(`Market request failed (${response.status}).`);
+    }
+
+    function displayGlobalStatsPlaceholder() {
+      els.globalStats.innerHTML = `
+        ${statCard("🌍 Total Market Cap", "—", "Temporarily unavailable")}
+        ${statCard("📊 24h Volume", "—", "Temporarily unavailable")}
+        ${statCard("₿ BTC Dominance", "—", "Temporarily unavailable")}
+        ${statCard("🪙 Active Assets", "—", "Temporarily unavailable")}
+      `;
     }
 
     function displayGlobalStats(data) {
@@ -963,20 +1065,34 @@
     function sortAndDisplayCoins() {
       const sorted = [...filteredCoins];
 
-      const safe = value => Number.isFinite(value) ? value : -Infinity;
+      const finiteOr = (value, fallback) =>
+        Number.isFinite(Number(value)) ? Number(value) : fallback;
 
       switch (currentSort) {
         case "volume_desc":
-          sorted.sort((a, b) => safe(b.total_volume) - safe(a.total_volume));
+          sorted.sort((a, b) =>
+            finiteOr(b.total_volume, -Infinity) - finiteOr(a.total_volume, -Infinity)
+          );
           break;
+
         case "gainers":
-          sorted.sort((a, b) => safe(b.price_change_percentage_24h) - safe(a.price_change_percentage_24h));
+          sorted.sort((a, b) =>
+            finiteOr(b.price_change_percentage_24h, -Infinity) -
+            finiteOr(a.price_change_percentage_24h, -Infinity)
+          );
           break;
+
         case "losers":
-          sorted.sort((a, b) => safe(a.price_change_percentage_24h) - safe(b.price_change_percentage_24h));
+          sorted.sort((a, b) =>
+            finiteOr(a.price_change_percentage_24h, Infinity) -
+            finiteOr(b.price_change_percentage_24h, Infinity)
+          );
           break;
+
         default:
-          sorted.sort((a, b) => safe(b.market_cap) - safe(a.market_cap));
+          sorted.sort((a, b) =>
+            finiteOr(b.market_cap, -Infinity) - finiteOr(a.market_cap, -Infinity)
+          );
       }
 
       displayCoins(sorted);
@@ -1018,10 +1134,10 @@
         });
 
         row.innerHTML = `
-          <td class="rank">${index + 1}</td>
+          <td class="rank">${Number.isFinite(Number(coin.market_cap_rank)) ? coin.market_cap_rank : index + 1}</td>
           <td>
             <div class="coin-info">
-              <img class="coin-icon" src="${escapeAttr(coin.image || "")}" alt="" loading="lazy">
+              <img class="coin-icon" src="${escapeAttr(coin.image || "")}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
               <div>
                 <div class="coin-name">${escapeHtml(coin.name || "Unknown")}</div>
                 <div class="coin-symbol">${escapeHtml((coin.symbol || "—").toUpperCase())}</div>
@@ -1093,7 +1209,7 @@
           <div class="modal-inner">
             <div class="modal-top">
               <div class="modal-coin-header">
-                <img class="modal-coin-icon" src="${escapeAttr(data.image?.large || "")}" alt="">
+                <img class="modal-coin-icon" src="${escapeAttr(data.image?.large || "")}" alt="" onerror="this.style.visibility='hidden'">
                 <div class="modal-coin-title">
                   <h2 id="modalCoinName">${escapeHtml(data.name || "Unknown")}</h2>
                   <p>${escapeHtml((data.symbol || "—").toUpperCase())}</p>
@@ -1191,6 +1307,11 @@
     }
 
     function chartOptions({ indexAxis = "x", tooltipLabel } = {}) {
+      const light = document.body.dataset.theme === "light";
+      const gridColor = light ? "rgba(15,23,42,.07)" : "rgba(255,255,255,.045)";
+      const tooltipBg = light ? "#ffffff" : "#081321";
+      const tooltipText = light ? "#0f172a" : "#f8fafc";
+
       return {
         responsive: true,
         maintainAspectRatio: false,
@@ -1199,8 +1320,10 @@
         plugins: {
           legend: { display: false },
           tooltip: {
-            backgroundColor: "#081321",
-            borderColor: "rgba(255,255,255,.08)",
+            backgroundColor: tooltipBg,
+            titleColor: tooltipText,
+            bodyColor: tooltipText,
+            borderColor: light ? "rgba(15,23,42,.10)" : "rgba(255,255,255,.08)",
             borderWidth: 1,
             displayColors: false,
             callbacks: { label: tooltipLabel }
@@ -1208,7 +1331,7 @@
         },
         scales: {
           x: {
-            grid: { color: "rgba(255,255,255,.045)" },
+            grid: { color: gridColor },
             ticks: {
               callback(value) {
                 if (indexAxis === "y") {
@@ -1220,7 +1343,7 @@
             }
           },
           y: {
-            grid: { color: "rgba(255,255,255,.045)" },
+            grid: { color: gridColor },
             ticks: {
               callback(value) {
                 if (indexAxis === "x" && Number.isFinite(Number(value))) {
@@ -1235,6 +1358,7 @@
     }
 
     function formatCurrency(value) {
+      if (value === null || value === undefined || value === "") return "—";
       const num = Number(value);
       if (!Number.isFinite(num)) return "—";
       if (num === 0) return "$0.00";
@@ -1258,7 +1382,9 @@
     }
 
     function formatInteger(value) {
-      return new Intl.NumberFormat().format(Number(value) || 0);
+      if (value === null || value === undefined || value === "") return "—";
+      const num = Number(value);
+      return Number.isFinite(num) ? new Intl.NumberFormat().format(num) : "—";
     }
 
     function signedPercent(value) {
@@ -1283,8 +1409,15 @@
       if (!allCoins.length) els.coinsContainer.classList.add("hidden");
     }
 
+    function showWarning(message) {
+      els.errorMessage.innerHTML = `<div>⚠️ ${escapeHtml(message)}</div>`;
+      els.errorMessage.classList.remove("hidden");
+      if (allCoins.length) els.coinsContainer.classList.remove("hidden");
+    }
+
     function hideError() {
       els.errorMessage.classList.add("hidden");
+      els.errorMessage.innerHTML = "";
     }
 
     function setApiHealthy(healthy) {
